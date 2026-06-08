@@ -820,6 +820,23 @@ impl Session {
             Ok(None)
         }
     }
+
+    /// Peek at body bytes from the preread buffer without consuming them.
+    ///
+    /// This method is idempotent and returns bytes from the preread buffer only.
+    /// Only supported for HTTP/1.x sessions.
+    ///
+    /// Returns `None` if:
+    /// - Session is not HTTP/1.x
+    /// - Body reader is already initialized
+    /// - Already peeked before
+    /// - Chunked encoding is used
+    /// - No preread body is available or has zero length
+    ///
+    /// The returned bytes are truncated to `min(preread_body.len(), max_bytes)`.
+    pub fn peek_body(&mut self, max_bytes: usize) -> Option<Bytes> {
+        self.downstream_session.try_peek_from_preread(max_bytes)
+    }
 }
 
 impl AsRef<HttpSession> for Session {
@@ -1591,5 +1608,60 @@ where
             service.set_runtime_opts_override(runtime_opts_override);
         }
         service
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_test::io::Builder;
+
+    async fn session_with_body() -> Session {
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = Session::new_h1(Box::new(mock_io));
+        s.read_request().await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_happy_path() {
+        let mut s = session_with_body().await;
+
+        let peeked = s.peek_body(64);
+        assert!(peeked.is_some());
+        assert_eq!(peeked.unwrap().as_ref(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_no_preread() {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = Session::new_h1(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        let peeked = s.peek_body(64);
+        assert!(peeked.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_partial() {
+        let mut s = session_with_body().await;
+
+        let peeked = s.peek_body(5);
+        assert!(peeked.is_some());
+        assert_eq!(peeked.unwrap().as_ref(), b"01234");
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_idempotent() {
+        let mut s = session_with_body().await;
+
+        let peeked1 = s.peek_body(64);
+        assert!(peeked1.is_some());
+        assert_eq!(peeked1.unwrap().as_ref(), b"0123456789");
+
+        let peeked2 = s.peek_body(64);
+        assert!(peeked2.is_none());
     }
 }

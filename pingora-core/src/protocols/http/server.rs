@@ -950,4 +950,26 @@ impl Session {
             Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
+
+    /// Peek at body bytes from the preread buffer without consuming them.
+    ///
+    /// This method is idempotent (calling it multiple times returns None on subsequent calls)
+    /// and returns bytes from the preread_body buffer only - no I/O is performed.
+    ///
+    /// Returns `None` if:
+    /// - Session is not HTTP/1.x
+    /// - Body reader is already initialized
+    /// - Already peeked before
+    /// - Chunked encoding is used
+    /// - No preread body is available or has zero length
+    ///
+    /// The returned bytes are truncated to `min(preread_body.len(), max_bytes)`.
+    pub fn try_peek_from_preread(&mut self, max_bytes: usize) -> Option<Bytes> {
+        match self {
+            Self::H1(s) => s.try_peek_from_preread(max_bytes),
+            Self::H2(_) => None,
+            Self::Subrequest(_) => None,
+            Self::Custom(_) => None,
+        }
+    }
 }
