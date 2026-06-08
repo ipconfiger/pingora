@@ -140,7 +140,7 @@ pub struct HttpSession {
     /// Defaults to false. Can be enabled via [`set_pipelining_enabled`](Self::set_pipelining_enabled).
     /// See [`Self::set_pipelining_enabled`] for RFC 9112 §9.3.2 semantics.
     pipelining_enabled: bool,
-    /// Pipelined bytes from the previous request on the same keep-alive connection,
+    /// Pipelined idle bytes from the previous request on the same keep-alive connection,
     /// to be parsed as the start of this session's request. Consumed on the first
     /// call to [`Self::read_request`]. Set via [`Self::set_pipelined_prefix`] after
     /// the previous session's [`BodyReader::take_body_overread`] yielded bytes.
@@ -154,6 +154,8 @@ pub struct HttpSession {
     /// [`super::super::HttpPersistentSettings`] into the next session.
     /// Scoped narrowly so it cannot affect FIN / `abort_on_close` semantics.
     pipelined_idle_bytes_stashed: bool,
+    /// Track whether `try_peek_from_preread` has been called.
+    peek_body_done: bool,
 }
 
 impl HttpSession {
@@ -202,6 +204,7 @@ impl HttpSession {
             pipelining_enabled: false,
             pipelined_prefix: None,
             pipelined_idle_bytes_stashed: false,
+            peek_body_done: false,
         }
     }
 
@@ -1061,6 +1064,45 @@ impl HttpSession {
     /// Return how many request body bytes (application, not wire) already read from downstream
     pub fn body_bytes_read(&self) -> usize {
         self.body_bytes_read
+    }
+
+    /// Fast path: peek at preread request body bytes without initializing the body reader.
+    ///
+    /// This method is idempotent (calling it multiple times returns None on subsequent calls)
+    /// and returns bytes from the preread_body buffer only - no I/O is performed.
+    ///
+    /// Returns `None` if:
+    /// - Body reader is already initialized (`!need_init()`)
+    /// - Already peeked before (`peek_body_done == true`)
+    /// - Chunked encoding is used (chunked has framing mixed in)
+    /// - No preread body is available (`preread_body.is_none()`) or has zero length
+    ///
+    /// The returned bytes are truncated to `min(preread_body.len(), max_bytes)`.
+    pub fn try_peek_from_preread(&mut self, max_bytes: usize) -> Option<Bytes> {
+        if !self.body_reader.need_init() {
+            return None;
+        }
+
+        if self.peek_body_done {
+            return None;
+        }
+
+        if self.is_chunked_encoding() {
+            return None;
+        }
+
+        let preread_ref = self.preread_body.as_ref()?;
+
+        if preread_ref.is_empty() {
+            return None;
+        }
+
+        self.peek_body_done = true;
+
+        let actual_len = preread_ref.len().min(max_bytes);
+        let truncated_ref = BufRef(preread_ref.0, preread_ref.0 + actual_len);
+
+        Some(truncated_ref.get_bytes(&self.buf))
     }
 
     fn is_chunked_encoding(&self) -> bool {
@@ -4285,5 +4327,95 @@ mod test_pipelining {
             .unwrap()
             .expect("pipelined request must parse");
         assert_eq!(b.req_header().uri.path(), "/two");
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_happy_path() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // Peek should return the preread body bytes
+        let peeked = s.try_peek_from_preread(64);
+        assert!(peeked.is_some());
+        assert_eq!(peeked.unwrap().as_ref(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_no_preread() {
+        init_log();
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // No body, preread_body is either None or has zero length
+        let peeked = s.try_peek_from_preread(64);
+        assert!(peeked.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_chunked_skip() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // Chunked encoding should skip peeking
+        let peeked = s.try_peek_from_preread(64);
+        assert!(peeked.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_after_init() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // Initialize body reader
+        s.read_body_bytes().await.unwrap();
+
+        // After init, peek should return None
+        let peeked = s.try_peek_from_preread(64);
+        assert!(peeked.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_idempotent() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // First peek should return data
+        let peeked1 = s.try_peek_from_preread(64);
+        assert!(peeked1.is_some());
+        assert_eq!(peeked1.unwrap().as_ref(), b"0123456789");
+
+        // Second peek should return None (idempotent)
+        let peeked2 = s.try_peek_from_preread(64);
+        assert!(peeked2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_body_partial() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // Request 64 bytes, but only 10 available
+        let peeked = s.try_peek_from_preread(64);
+        assert!(peeked.is_some());
+        let bytes = peeked.unwrap();
+        assert_eq!(bytes.as_ref(), b"0123456789");
+        assert_eq!(bytes.len(), 10);
     }
 }
