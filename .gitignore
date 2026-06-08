@@ -7,3 +7,5 @@ dhat-heap.json
 .cover
 bleeper.user.toml
 .DS_Store
+AGENTS.md
+.sisyphus
