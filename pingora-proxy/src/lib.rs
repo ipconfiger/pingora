@@ -834,8 +834,38 @@ impl Session {
     /// - No preread body is available or has zero length
     ///
     /// The returned bytes are truncated to `min(preread_body.len(), max_bytes)`.
-    pub fn peek_body(&mut self, max_bytes: usize) -> Option<Bytes> {
+    pub(crate) fn peek_body(&mut self, max_bytes: usize) -> Option<Bytes> {
         self.downstream_session.try_peek_from_preread(max_bytes)
+    }
+
+    /// Extract the `model` value from the request body for upstream routing.
+    ///
+    /// Peeks at the first `max_bytes` of the request body without consuming it,
+    /// then extracts the JSON `"model"` field value using lightweight string matching.
+    ///
+    /// Returns `None` if the body is unavailable, already consumed, chunked,
+    /// or the `"model"` key is not found in the peeked bytes.
+    pub fn extract_model_name(&mut self, max_bytes: usize) -> Option<String> {
+        let body = self.peek_body(max_bytes)?;
+        let s = std::str::from_utf8(&body).ok()?;
+
+        let prefix = r#""model""#;
+        let start = s.find(prefix)?;
+        let after_key = &s[start + prefix.len()..];
+
+        let after_key = after_key.trim_start();
+        if !after_key.starts_with(':') {
+            return None;
+        }
+        let after_colon = after_key[1..].trim_start();
+
+        if !after_colon.starts_with('"') {
+            return None;
+        }
+        let rest = &after_colon[1..];
+
+        let value_end = rest.find('"')?;
+        Some(rest[..value_end].to_string())
     }
 }
 
@@ -1663,5 +1693,62 @@ mod tests {
 
         let peeked2 = s.peek_body(64);
         assert!(peeked2.is_none());
+    }
+
+    async fn session_with_model_body(model_json: &[u8]) -> Session {
+        let content_length = format!("Content-Length: {}\r\n", model_json.len());
+        let mut request = Vec::new();
+        request.extend_from_slice(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n");
+        request.extend_from_slice(content_length.as_bytes());
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(model_json);
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = Session::new_h1(Box::new(mock_io));
+        s.read_request().await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn test_extract_model_gpt4() {
+        let mut s = session_with_model_body(br#"{"model":"gpt-4","messages":[]}"#).await;
+        assert_eq!(s.extract_model_name(64), Some("gpt-4".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_extract_model_with_spaces() {
+        let mut s =
+            session_with_model_body(br#"{"model" : "claude-3.5-sonnet", "prompt": "hi"}"#).await;
+        assert_eq!(
+            s.extract_model_name(64),
+            Some("claude-3.5-sonnet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_model_no_body() {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = Session::new_h1(Box::new(mock_io));
+        s.read_request().await.unwrap();
+        assert_eq!(s.extract_model_name(64), None);
+    }
+
+    #[tokio::test]
+    async fn test_extract_model_no_model_key() {
+        let mut s = session_with_model_body(br#"{"prompt":"hello","max_tokens":100}"#).await;
+        assert_eq!(s.extract_model_name(64), None);
+    }
+
+    #[tokio::test]
+    async fn test_extract_model_idempotent() {
+        let mut s = session_with_model_body(br#"{"model":"gpt-4o","messages":[]}"#).await;
+        assert_eq!(s.extract_model_name(64), Some("gpt-4o".to_string()));
+        assert_eq!(s.extract_model_name(64), None);
+    }
+
+    #[tokio::test]
+    async fn test_extract_model_partial_body() {
+        let mut s = session_with_model_body(br#"{"model":"gpt-4o-mini","m":"#).await;
+        assert_eq!(s.extract_model_name(23), Some("gpt-4o-mini".to_string()));
     }
 }
